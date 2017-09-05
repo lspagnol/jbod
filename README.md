@@ -16,7 +16,7 @@ It runs on:
 * Dell PowerVault MD3060e JBOD (60 disks array)
 
 * ZFS:
-  * 9 vdevs off 6 disks (600 Gb 2.5 SAS @ 10Krpm /) => 54 disks / JBOD
+  * 1 ZPOOL => 9 RAIDZ2 vdevs of 6 disks (600 Gb 2.5 SAS @ 10Krpm /) => 54 disks / JBOD
   * 2 x 600 Gb 2.5 SAS @ 10Krpm (spare / JBOD)
   * 2 x 8 Gb ZeusRAM for ZIL / JBOD
   * => 2 free slots on JBOD
