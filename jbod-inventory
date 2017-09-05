@@ -1,0 +1,106 @@
+#!/bin/bash
+
+date=$(date "+%Y%m%d-%H%M%S")
+
+CONF="/usr/local/etc/jbod.conf"
+OUTD="/tmp/jbod-inventory_${HOSTNAME}_${date}"
+
+if [ -f ${CONF} ] ; then
+        . ${CONF}
+else
+        echo "ERROR: '${CONF}' not found"
+        exit 1
+fi
+
+if [ ! -d ${OUTD} ] ; then
+	mkdir ${OUTD}
+fi
+
+#----------------------------------------------------------------------------
+cat<<EOF> ${OUTD}/summary.log
+#############################################################################
+
+# INVENTORY: ${date}
+
+#############################################################################
+
+# **** PREDICTIVE FAILURE(s) ****
+# **** Disks with uncorrected errors or bad SMART status ****
+# jbod status disks_bad
+
+EOF
+jbod status disks_bad >> ${OUTD}/summary.log
+#----------------------------------------------------------------------------
+
+cat<<EOF>> ${OUTD}/summary.log
+
+#############################################################################
+
+# **** Free disks without errors ****
+# jbod status disks_free
+
+EOF
+jbod status disks_free >> ${OUTD}/summary.log
+#----------------------------------------------------------------------------
+
+cat<<EOF>> ${OUTD}/summary.log
+
+#############################################################################
+
+# jbod status disks -v
+
+EOF
+jbod status disks -v >> ${OUTD}/summary.log
+#----------------------------------------------------------------------------
+
+cat<<EOF>> ${OUTD}/summary.log
+
+#############################################################################
+
+# JBOD SLOTS
+# jbod status slots
+
+EOF
+jbod status slots >> ${OUTD}/summary.log
+#----------------------------------------------------------------------------
+
+cat<<EOF>> ${OUTD}/summary.log
+
+#############################################################################
+
+# jbod status jbod
+
+EOF
+jbod status jbod >> ${OUTD}/summary.log
+#----------------------------------------------------------------------------
+
+cat<<EOF>> ${OUTD}/summary.log
+
+#############################################################################
+
+# jbod status zpool
+
+EOF
+jbod status zpool >> ${OUTD}/summary.log
+#----------------------------------------------------------------------------
+
+sqlite3 ${DB} "select Device,SerialNumber from devs order by SerialNumber" |sed 's/|/ /g' |uniq -f1 |while read dev ; do
+	dev=(${dev})
+	SerialNumber=${dev[1]}
+	Device=${dev[0]}
+	jbod func db_search ${dev} > ${OUTD}/smart_${SerialNumber}.log
+	cat<<EOF>> ${OUTD}/smart_${SerialNumber}.log
+
+#############################################################################
+
+smartctl -x /dev/${Device}
+
+EOF
+	echo "Collecting SMART for /dev/${Device}"
+	smartctl -x /dev/${Device} >> ${OUTD}/smart_${SerialNumber}.log
+done
+#----------------------------------------------------------------------------
+
+pushd /tmp
+tar -czf ${OUTD}.tgz ${OUTD}/
+popd

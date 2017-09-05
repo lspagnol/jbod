@@ -1,0 +1,622 @@
+#!/bin/bash
+
+date=$(date "+%Y%m%d-%H%M%S")
+
+CONF="/usr/local/etc/jbod.conf"
+
+if [ -f ${CONF} ] ; then
+	. ${CONF}
+else
+	echo "ERROR: '${CONF}' not found"
+	exit 1
+fi
+
+SCRIPT="/usr/local/sbin/jbod"
+
+#################################################################
+# Multipath
+
+function mpath_update {		# Update multipath ways
+
+local dev serial
+for dev in $(devs_list) ; do
+	# recuperer no serie disque
+	serial=$(camcontrol inquiry ${dev} -S)
+	# verifier si le numero de serie existe
+	# en tant que label multipath
+	gmultipath list ${serial} >/dev/null 2>/dev/null
+	if [ $? -ne 0 ] ; then # Creer le chemin multipath et affecter le disque
+		cmd="gmultipath label -v -A ${serial} ${dev}"
+		FDO ${cmd}
+	else
+		# verifier si le numero de serie du disque
+		# est affecte a un chemin multipath
+		gmultipath list ${serial} 2>/dev/null |grep -q ". Name: ${dev}$"
+		if [ $? -ne 0 ] ; then # Affecter le disque au chemin existant
+			cmd="gmultipath add ${serial} ${dev}"
+			FDO ${cmd}
+		else
+			echo "${dev} ${serial} ... OK"
+		fi
+	fi
+done
+
+}
+
+function mpath_destroy {	# Destroy all multipath ways ( ** DANGEROUS ** )
+				# < "export EXPERT_MODE=yes" for allowing it
+
+CHECK_MODE
+
+for serial in $(gmultipath list |grep "^Geom name:" |awk '{print $3}') ; do
+	cmd="gmultipath destroy ${serial}"
+	FDO ${cmd}
+done
+
+}
+
+#################################################################
+# ZFS
+
+function zpool_create {		# Create and configure ZPOOL ( ** DANGEROUS ** )
+				# < see configuration file
+				# < "export EXPERT_MODE=yes" for allowing it
+
+CHECK_MODE
+
+local devs i j k m cmd opt
+
+devs=( ${VDEV_DRIVES} )
+for ((j = 0 ; j < ${NVDEV} ; j++)) ; do
+	unset m
+	for ((i = 0 ; i < ${NDVDEV} ; i++)) ; do
+		k=$(( ( ${j} * ${NDVDEV} ) + ${i} ))
+		m="${m} ${devs[$k]}"
+	done
+	if [ ${j} -eq 0 ] ; then
+		cmd="zpool create ${ZPOOL} ${VDEV_PREFIX}${m}"
+	else
+		cmd="zpool add ${ZPOOL} ${VDEV_PREFIX}${m}"
+	fi
+	FDO ${cmd}
+done
+
+# ZIL
+cmd="zpool add ${ZPOOL} log ${ZIL_PREFIX} ${ZIL_DRIVES}"
+FDO ${cmd}
+
+# L2ARC
+cmd="zpool add ${ZPOOL} cache ${L2ARC_PREFIX} ${L2ARC_DRIVES}"
+FDO ${cmd}
+
+# Options ZPOOL
+for opt in ${ZPOOL_OPTS} ; do
+	cmd="zpool set ${opt} ${ZPOOL}"
+	FDO ${cmd}
+done
+
+# Options ZFS
+for opt in ${ZFS_OPTS} ; do
+	cmd="zfs set ${opt} ${ZPOOL}"
+	FDO ${cmd}
+done
+	
+}
+
+function zpool_destroy {	# Destroy ZPOOL and suppress ZFS labels ( ** DANGEROUS ** )
+				# < see configuration file
+				# < "export EXPERT_MODE=yes" for allowing it
+
+CHECK_MODE
+
+local devs dev cmd
+
+devs=$(zpool_roles |cut -d " " -f2- )
+
+cmd="zpool destroy ${ZPOOL}"
+FDO ${cmd}
+
+for dev in ${devs} ; do
+	cmd="zpool labelclear /dev/${dev}"
+	FDO ${cmd}
+done
+
+}
+
+function zpool_roles {	# Display devices / roles / ZPOOL
+				# < see configuration file
+				# > vdev/role serials
+
+local line vdev dev
+(
+zpool status ${ZPOOL} |while read line ; do
+	line=(${line})
+	echo "${line[0]}" |egrep -q "raidz|spare|cache|logs"
+	if [ $? -eq 0 ] ; then
+		vdev=${line[0]}
+		echo -en "\n$vdev "
+	else
+		echo "${line[0]}" |egrep -q "^(multipath|mfi|da)"
+		if [ $? -eq 0 ] ; then
+			dev=${line[0]}
+			echo -n "${dev} "
+		else
+			echo "${line[5]}" | grep -q "was"
+			if [ $? -eq 0 ] ; then
+				dev=$(echo ${line[6]} |sed 's/\/dev\///g')
+				echo -n "${dev} "
+			fi
+		fi
+	fi
+done
+echo
+) | grep -v '^$'
+
+}
+
+function zpool_replace {	# Automaticaly replace unavailable device ( ** DANGEROUS ** )
+				# < see configuration file
+
+local unavail product avail
+
+unavail=$(sqlite3 ${DB} "select SerialNumber from devs where State='offline' and not ZpoolRole='FREE'" |sort |uniq |head -n 1)
+product=$(sqlite3 ${DB} "select Product from devs where SerialNumber='${unavail}'" |sort |uniq)
+avail=$(sqlite3 ${DB} "select SerialNumber from devs where State='online' and ZpoolRole='FREE' and Product='${product}'" |sort |uniq |head -n 1)
+
+if [ "${unavail}" = "" ] ; then
+	zpool status ${ZPOOL} |head -n 8
+	echo
+	echo "No unavailable device in ZPOOL"
+	exit
+else
+
+	if [ "${avail}" = "" ] ; then
+		echo "Cannot repair: no free device available"
+		exit 1
+	fi
+fi
+
+unavail="multipath/${unavail}"
+avail="multipath/${avail}"
+
+cat<<EOF
+Unavailable device '${unavail}' will be replaced by device '${avail}':
+
+zpool replace ${ZPOOL} ${unavail} ${avail}
+zpool offline ${ZPOOL} ${unavail}
+zpool detach ${ZPOOL} ${unavail}
+
+EOF
+
+CHECK_MODE
+
+cmd="zpool replace ${ZPOOL} ${unavail} ${avail}"
+FDO ${cmd}
+
+cmd="zpool offline ${ZPOOL} ${unavail}"
+FDO ${cmd}
+
+cmd="zpool detach ${ZPOOL} ${unavail}"
+FDO ${cmd}
+
+echo
+db_update
+echo
+
+zpool status ${ZPOOL} |head -n 8
+echo
+
+}
+
+
+#################################################################
+# Database (devices informations)
+
+function db_init {		# Create new empty db
+				# < see configuration file
+
+[ -f ${DB} ] && rm ${DB}
+sqlite3 ${DB} "create table devs(Slot int, Location varchar, Device varchar, SerialNumber varchar, Vendor varchar,Product varchar,Revision varchar,RotationRate varchar,FormFactor varchar,MediaSize int,ZpoolRole varchar,State varchar,UErrors int,SHealth int,MpathState varchar)"
+
+}
+
+function db_update {		# Update db
+				# < see configuration file
+
+local dev serial slot location roles role result
+
+[ -f ${DB} ] || db_init
+
+roles=$(zpool_roles)
+sqlite3 ${DB} "update devs set State='offline'"
+        
+for dev in $(devs_list) ; do
+
+	echo -n "${dev} "
+	eval "$(dev_info ${dev})"
+	serial=$(camcontrol inquiry /dev/${dev} -S)
+	echo -n "${serial} "
+	slot=$(dev_slot ${dev})
+	echo -n "${slot} "
+	location=$(slot_location ${slot})
+	echo -n "${location} ... "
+	role=$(echo "${roles}" |sed 's/multipath\///g' |egrep " ${serial}( |$)" |awk '{print $1}')
+	role=${role:-FREE}
+
+	# Lecture donnes predictives SMART
+	SHealth=$(smart_health ${dev})
+
+	# Lecture des erreurs SMART non corrigees
+	UErrors=$(smart_errors ${dev})
+
+	# Etat du lien multipath
+	MpathState=$(mpath_state ${dev})
+
+	# Disque deja reference ?
+	sqlite3 ${DB} "select SerialNumber from devs where Device='${dev}' and SerialNumber='${serial}'" |grep -q "^${serial}$"
+	if [ $? -ne 0 ] ; then
+		sqlite3 ${DB} "insert into devs values('${slot}','${location}','${dev}','${serial}','${Vendor}','${Product}','${Revision}','${RotationRate}','${FormFactor}','${Mediasize}','${role}','online','${UErrors}','${SHealth}','${MpathState}')"
+		echo "ADDED"
+	else
+		sqlite3 ${DB} "update devs set Slot='${slot}',Location='${location}',ZpoolRole='${role}',State='online',UErrors='${UErrors}',MpathState='${MpathState}',SHealth='${SHealth}' where Device='${dev}' and SerialNumber='${serial}'"
+		echo "UPDATED"
+	fi
+
+done
+
+
+}
+
+
+function db_clean {		# Suppress 'offline' devices from db
+
+sqlite3 ${DB} "delete from devs where State='offline'"
+
+}
+
+function db_show {		# Display db content
+				# < see configuration file
+				# > database content
+
+if [ "${1}" = "-v" ] ; then 
+	shift
+	sqlite3 -cmd ".width 4 8 6 15 15 15 15 15" -column -header ${DB} "select * from devs ${@} order by slot"
+else
+	sqlite3 -cmd ".width 4 8 6 15 15 15 15 15" -column -header ${DB} "select Slot,Location,Device,SerialNumber,Product,ZpoolRole,State,UErrors,SHealth,MpathState from devs ${@} order by slot"
+fi
+
+}
+
+function db_show_bad {		# Display db content (bad disks only)
+				# < see configuration file
+				# > database content
+if [ "${1}" = "-v" ] ; then
+	shift
+	sqlite3 -cmd ".width 4 8 6 15 15 15 15 15" -column -header ${DB} "select * from devs where UErrors>'0' or SHealth>'0' order by slot"
+else
+	sqlite3 -cmd ".width 4 8 15 15 15 15 15" -column -header ${DB} "select Slot,Location,SerialNumber,Product,ZpoolRole,UErrors,SHealth from devs where UErrors>'0' or SHealth>'0' order by slot" |uniq
+fi
+
+}
+
+function db_show_free {		# Display db content (free disks with no errors only)
+				# < see configuration file
+				# > database content
+if [ "${1}" = "-v" ] ; then
+	shift
+	sqlite3 -cmd ".width 4 8 6 15 15 15 15 15" -column -header ${DB} "select * from devs where UErrors='0' and SHealth='0' and ZpoolRole='FREE' order by slot"
+else
+	sqlite3 -cmd ".width 4 8 15 15 15 15 15" -column -header ${DB} "select Slot,Location,SerialNumber,Product,ZpoolRole,UErrors,SHealth from devs where UErrors='0' and SHealth='0' and ZpoolRole='FREE' order by slot" |uniq
+fi
+
+}
+
+function db_search {		# Search device from db
+				# < da... or serial or multipath/serial
+				# > database content
+
+local serial
+
+echo ${1} | grep -q ^da
+if [ $? -eq 0 ] ; then
+	serial=$(camcontrol inquiry ${1} -S)
+else
+	serial=${1}
+fi
+
+serial=$(echo ${serial} |sed 's/multipath\///g')
+db_show ${2} "where SerialNumber='${serial}'"
+
+}
+
+#################################################################
+
+function devs_list {		# Devices list
+				# > da...
+geom disk list |grep "Geom name: " |sed 's/^Geom name: //g' |grep "^da"
+
+}
+
+function dev_info {		# Device informations
+				# < da...
+				# > informations
+
+smartctl -i /dev/${1}\
+ |egrep "^(Vendor|Product|Revision|Rotation Rate|Form Factor):"\
+ |sed 's/:[[:space:]]*/="/g ; s/$/"/g ; s/^Rotation Rate/RotationRate/g ; s/^Form Factor/FormFactor/g'
+geom disk list ${1}\
+ |egrep "(Mediasize):"\
+ |awk '{print $1$2}'\
+ |sed 's/:/="/g ; s/$/"/g'
+
+}
+
+function slots_status {		# Slots status
+				# > slots status
+local i j slots slot_status
+
+slots="$(jbod_status |grep '^Array device slot,' |grep -v ' Overall, ' |cut -d',' -f 2,6 |sed 's/^.*\] //g ; s/, status://g')"
+for ((i=0 ; i<60 ; i++)) ; do
+	j=$(( ${i} + 1 ))
+	slot_status="$(echo "${slots}" |grep "^${i} " |cut -d" " -f2-)"
+	echo "${j} ${slot_status}"
+done
+}
+
+function dev_target_port {	# Device target port
+				# < da...
+				# > target port
+
+local t
+t=$(sg_vpd --page=di_port /dev/${1} 2>/dev/null)
+[ $? -eq 0 ] && t=$(echo "${t}" |grep "^[[:space:]]*0x")
+if [ $? -eq 0 ] ; then
+	echo "${t}" |awk '{print $1}'
+	return 0
+else
+	return 1
+fi
+
+}
+
+function dev_slot {		# Device location
+				# < da...
+				# > slot_number(1-60)
+local t i r
+t=$(dev_target_port ${1})
+if [ $? -eq 0 ] ; then
+	for ((i = 0 ; i < ${NCMP} ; i++)) ; do
+		r=$(sg_ses -p 0xa ${SES}${i} 2>/dev/null |grep -B 6 ${t} |grep " device slot number: " |sed 's/.*device slot number: //g')
+		if [ "${r}" != "" ] ; then
+			echo "${r}"
+			return 0
+		fi
+	done
+	return 1
+else
+	return 1
+fi
+}
+
+function dev_location {		# Device location
+				# < da...
+				# > tray(0-4)-shelter(0-11)
+local s
+s=$(dev_slot ${1})
+if [ $? -eq 0 ] ; then
+	slot_location ${s}
+	return 0
+else
+	return 1
+fi
+}
+
+#################################################################
+
+function CHECK_MODE {		# Allow / disallow "EXPERT_MODE" operations
+				# < "export EXPERT_MODE=yes" for allowing it
+if [ "${EXPERT_MODE}" != "yes" ] ; then
+cat<<EOF
+ERROR: this operation allowed only in "EXPERT MODE"
+       Use it only if yoy realy know what you are doing !
+       'export EXPERT_MODE=yes' to enable "EXPERT MODE"
+
+EOF
+exit 1
+fi
+
+}
+
+function FDO {			# Display and execute command
+				# < cmd + args
+				# > cmd + args
+
+echo -n "${@} ... "
+if [ "${DEBUG}" = "1" ] ; then
+	echo "OK"
+	return 0
+else
+	${@} > /dev/null
+	if [ $? -eq 0 ] ; then
+		echo "OK"
+		return 0
+	else
+		return 1
+	fi
+fi
+}
+
+function slot_location {	# Caltulate slot position
+				# < slot_number(1-60)
+				# > tray(0-4)-shelter(0-11)
+
+local s t b e
+s=${1} # numero slot (1=>60)
+((s--))
+t=$((${s}/${SPT})) # numero tiroir (0=>4)
+b=$((${t}*${SPT}))
+e=$((${s}-${b})) # numero emplacement (0=>11)
+echo "${t}-${e}"
+
+}
+
+function jbod_status {		# JBOD status
+				# > Element : status
+
+/usr/local/bin/sg_ses --page=0x2 /dev/ses0 |while read line ; do
+
+	array=(${line})
+	
+	if [ "${array[0]} ${array[1]}" = "Element type:" ] ; then
+		element_type="${line#Element type: }"
+	fi
+
+	if [ "${array[0]} ${array[2]}" = "Element descriptor:" ] ; then
+		element_descriptor=${array[1]}
+	fi
+
+	if [ "${array[0]} ${array[1]}" = "Overall descriptor:" ] ; then
+		element_descriptor=${array[0]}
+	fi
+
+
+	if [ "${array[4]}" = "status:" ] ; then
+		status=${line}
+		echo "${element_type} ${element_descriptor}, ${status}"
+		unset status
+	fi
+
+done
+
+}
+
+function smart_errors {		# Return number of uncorrected Smart errors
+				# < da..
+				# > number of errors
+
+local e
+e=$(/usr/local/sbin/smartctl -l error /dev/${1} |egrep "^(read:|write:|verify:)" |awk '{print $8}')
+echo $(( $(echo ${e} |sed 's/ /+/g')))
+
+}
+
+function smart_health {		# Return smart status (predictive failure)
+				# < da..
+				# > smart status (0 => Ok, other => warning)
+smartctl -H /dev/${1} 2>/dev/null >/dev/null
+echo $?
+
+}
+
+function mpath_state {		# Return multipath state
+				# < da..
+				# ACTIVE | FAIL
+
+gmultipath status |grep " ${1} " |cut -d"(" -f2 |cut -d")" -f1
+
+}
+
+
+# ###############################################################
+
+case ${1} in
+
+	help)
+cat<<EOF
+
+== Commands: ==
+
+ init			Multipath UPG + db init + db UPG
+ 			No arg
+
+ update			Multipath UPG + db UPG
+			No arg
+
+ clean			Suppress offline disks from db
+ 			No arg
+
+ status disks		Disks status (from db)
+ 			"-v" for full informations
+
+ status disks_bad	Bad disks status (from db)
+ 			"-v" for full informations
+
+ status disks_free	Free disks with no errors (from db)
+ 			"-v" for full informations
+
+ status slots		Slots status
+			No arg
+		
+ status jbod		JBOD status
+			No arg
+
+ status zpool		Disks roles / ZPOOL
+			No arg
+
+ search			Disk search
+ 			Arg: disk => da... or SerialNumber or multipath/SerialNumber
+ 			"-v" for full informations
+
+ func			Execute functions (use "func help" for help)
+
+
+== Notes: ==
+
+ Slot number start at '1' for 'status disks' and 'status slots'
+                      '0' for 'status jbod'
+
+ Slot location in JBOD: tray-shelter (vertical-horizontal)
+            vertical => upper tray: 0, lower tray: 4 
+          horizontal => see matrix on front of trays for shelter number
+ 
+EOF
+	;;
+	"")
+		echo "Usage: jbod [<cmd>] [<args>] [help]"
+	;;
+	init)
+		mpath_update
+		db_init
+		db_update
+	;;
+	update)
+		mpath_update
+		db_update
+
+	;;
+	clean)
+		db_clean
+	;;
+	status)
+		case ${2} in
+			disks) db_show ${3} ;;
+			disks_bad) db_show_bad ${3};;
+			disks_free) db_show_free ${3};;
+			jbod) jbod_status;;
+			slots) slots_status;;
+			zpool) zpool_roles;;
+			"")
+				echo "Usage: jbod status disks|jbod|slots|zpool"
+				exit 1
+			;;
+		esac
+	;;
+	search)
+		db_search ${2} ${3}
+	;;
+	func)
+		shift
+		case ${1} in
+			help)
+				cat ${SCRIPT} |egrep "^(##|function|[[:space:]]*# <)|[[:space:]]*# >" |grep -v egrep
+				exit 0
+			;;
+			"")
+				echo "Usage: jbod func [<function>] [<cmd>] [<args>] [help]"
+				exit 0
+			;;
+		esac
+		"$@"
+	;;
+
+esac
